@@ -17,6 +17,18 @@ $$;
 revoke all on function public.emz_is_member() from public;
 grant execute on function public.emz_is_member() to authenticated;
 
+
+-- Owner-approved link editing. Only the database owner can change this switch.
+create table if not exists public.emz_sharing(id integer primary key check(id=1),link_editing boolean not null default false);
+alter table public.emz_sharing enable row level security;
+revoke all on public.emz_sharing from anon,authenticated;
+insert into public.emz_sharing(id,link_editing) values(1,false) on conflict do nothing;
+create or replace function public.emz_can_edit() returns boolean
+language sql stable security definer set search_path='' as $$
+ select coalesce((select link_editing from public.emz_sharing where id=1),false) or public.emz_is_member()
+$$;
+revoke all on function public.emz_can_edit() from public;
+
 create or replace function public.emz_public_document(d jsonb) returns jsonb
 language sql immutable set search_path='' as $$
  select jsonb_build_object('schema','emz-studio-v2','revision',d->'revision','snapshotId',d->'snapshotId',
@@ -32,12 +44,12 @@ create or replace function public.emz_read(team boolean default false,known_revi
 language plpgsql stable security definer set search_path='' as $$
 declare w public.emz_workspace; allowed boolean;
 begin
- allowed:=public.emz_is_member();
+ allowed:=public.emz_can_edit();
  if team and not allowed then raise exception 'Your account does not have EMZ team access.'; end if;
  select * into w from public.emz_workspace where id=1;
  if w.document is null then return null; end if;
  if w.revision=known_revision then return jsonb_build_object('revision',w.revision,'can_edit',allowed); end if;
- return jsonb_build_object('revision',w.revision,'can_edit',allowed,'document',case when team and allowed then w.document else public.emz_public_document(w.document) end);
+ return jsonb_build_object('revision',w.revision,'can_edit',allowed,'document',case when allowed and (team or coalesce((select link_editing from public.emz_sharing where id=1),false)) then w.document else public.emz_public_document(w.document) end);
 end $$;
 revoke all on function public.emz_read(boolean,bigint) from public;
 grant execute on function public.emz_read(boolean,bigint) to anon,authenticated;
@@ -46,7 +58,7 @@ create or replace function public.emz_save(expected_revision bigint,document jso
 language plpgsql security definer set search_path='' as $$
 declare w public.emz_workspace; p jsonb; next_revision bigint;
 begin
- if not public.emz_is_member() then raise exception 'Team access required.'; end if;
+ if not public.emz_can_edit() then raise exception 'Team access required.'; end if;
  if document->>'schema'<>'emz-studio-v2' or jsonb_typeof(document->'posts') is distinct from 'array' or jsonb_array_length(document->'posts')>3000 or octet_length(document::text)>15000000 then raise exception 'Invalid workspace document.'; end if;
  if (select count(*)<>count(distinct x->>'id') from jsonb_array_elements(document->'posts') x) then raise exception 'Duplicate post IDs.'; end if;
  for p in select * from jsonb_array_elements(document->'posts') loop
@@ -62,7 +74,7 @@ begin
  return jsonb_build_object('revision',next_revision);
 end $$;
 revoke all on function public.emz_save(bigint,jsonb) from public;
-grant execute on function public.emz_save(bigint,jsonb) to authenticated;
+grant execute on function public.emz_save(bigint,jsonb) to anon,authenticated;
 
 create or replace function public.emz_access(operation text default 'list',member_email text default '',member_role text default 'editor') returns jsonb
 language plpgsql security definer set search_path='' as $$
